@@ -1,0 +1,286 @@
+name: Sync Upstream and Build Binaries
+
+on:
+  schedule:
+    # Poll upstream every 6 hours
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      force_tag:
+        description: 'Force build a specific upstream tag (e.g. v0.8.1). Leave empty to use latest upstream release.'
+        required: false
+        default: ''
+      force_rebuild:
+        description: 'Rebuild even if a release for that tag already exists.'
+        required: false
+        default: 'false'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-and-build
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: idris-lang/Idris2
+
+jobs:
+
+  ######################################################################
+  # Resolve which upstream tag we should build (if any).
+  ######################################################################
+  check-upstream:
+    name: Check upstream for new release
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      should_build: ${{ steps.resolve.outputs.should_build }}
+    steps:
+      - name: Resolve target tag
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE_TAG: ${{ github.event.inputs.force_tag }}
+          FORCE_REBUILD: ${{ github.event.inputs.force_rebuild }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${FORCE_TAG:-}" ]; then
+            TAG="$FORCE_TAG"
+            echo "Using forced tag: $TAG"
+          else
+            TAG=$(curl -fsSL \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest" \
+              | jq -r '.tag_name')
+            echo "Latest upstream release tag: $TAG"
+          fi
+
+          if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
+            echo "Could not determine upstream tag; aborting." >&2
+            exit 1
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          if [ "${FORCE_REBUILD:-false}" = "true" ]; then
+            echo "Force rebuild requested."
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          STATUS=$(curl -fsS -o /dev/null -w "%{http_code}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/$TAG" || true)
+
+          if [ "$STATUS" = "200" ]; then
+            echo "Release $TAG already exists on this fork; skipping build."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Release $TAG not found on this fork; will build."
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  ######################################################################
+  # Mirror the upstream tag into this fork so the release page links to
+  # a real commit/tag in this repository.
+  ######################################################################
+  mirror-tag:
+    name: Mirror upstream tag into fork
+    needs: check-upstream
+    if: needs.check-upstream.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout upstream at tag
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.check-upstream.outputs.tag }}
+          fetch-depth: 0
+          path: upstream
+
+      - name: Push tag to this fork
+        working-directory: upstream
+        env:
+          TAG: ${{ needs.check-upstream.outputs.tag }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git remote add fork "https://x-access-token:${TOKEN}@github.com/${{ github.repository }}.git"
+          if git ls-remote --tags fork "refs/tags/${TAG}" | grep -q .; then
+            echo "Tag ${TAG} already present on fork; skipping push."
+          else
+            git push fork "refs/tags/${TAG}:refs/tags/${TAG}"
+            echo "Pushed tag ${TAG} to fork."
+          fi
+
+  ######################################################################
+  # Linux build (Ubuntu, Chez Scheme)
+  ######################################################################
+  build-linux:
+    name: Build Idris2 (Linux x86_64)
+    needs: [check-upstream, mirror-tag]
+    if: needs.check-upstream.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      IDRIS2_CG: chez
+      SCHEME: scheme
+      PREFIX: ${{ github.workspace }}/idris2-install
+    steps:
+      - name: Checkout upstream at tag
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.check-upstream.outputs.tag }}
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y chezscheme libgmp3-dev build-essential
+
+      - name: Bootstrap Idris2
+        run: make bootstrap SCHEME=scheme
+
+      - name: Install Idris2
+        run: make install
+
+      - name: Install Idris2 support libraries
+        run: make install-with-src-libs
+
+      - name: Package binary tarball
+        run: |
+          set -euo pipefail
+          ARCH=$(uname -m)
+          VERSION="${{ needs.check-upstream.outputs.tag }}"
+          PKG="idris2-${VERSION}-linux-${ARCH}"
+          mkdir -p dist
+          cp -r "$PREFIX" "dist/$PKG"
+          tar -C dist -czf "dist/${PKG}.tar.gz" "$PKG"
+          ( cd dist && sha256sum "${PKG}.tar.gz" > "${PKG}.tar.gz.sha256" )
+          echo "ARTIFACT_NAME=${PKG}" >> "$GITHUB_ENV"
+          echo "ARTIFACT_PATH=dist/${PKG}.tar.gz" >> "$GITHUB_ENV"
+          echo "ARTIFACT_SHA=dist/${PKG}.tar.gz.sha256" >> "$GITHUB_ENV"
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: |
+            ${{ env.ARTIFACT_PATH }}
+            ${{ env.ARTIFACT_SHA }}
+          if-no-files-found: error
+
+  ######################################################################
+  # Windows build (MSYS2 / MinGW64, Chez Scheme)
+  ######################################################################
+  build-windows:
+    name: Build Idris2 (Windows x86_64)
+    needs: [check-upstream, mirror-tag]
+    if: needs.check-upstream.outputs.should_build == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      MSYSTEM: MINGW64
+      MSYS2_PATH_TYPE: inherit
+      SCHEME: scheme
+      CC: gcc
+    steps:
+      - name: Disable autocrlf
+        run: git config --global core.autocrlf false
+
+      - name: Checkout upstream at tag
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.check-upstream.outputs.tag }}
+
+      - name: Install MSYS2 build tools
+        run: |
+          c:\msys64\usr\bin\bash -l -c "pacman -S --noconfirm tar make mingw-w64-x86_64-gcc mingw-w64-x86_64-gmp"
+          echo "PWD=$(c:\msys64\usr\bin\cygpath -u $(pwd))" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Get Chez Scheme
+        run: git clone --depth 1 --branch v9.5.8a https://github.com/cisco/ChezScheme
+
+      - name: Build Chez Scheme
+        run: c:\msys64\usr\bin\bash -l -c "cd $env:PWD && cd ChezScheme && ./configure --threads && make"
+
+      - name: Configure paths
+        run: |
+          $chez="$(pwd)\ChezScheme\ta6nt\bin\ta6nt"
+          $idris="$(pwd)\idris2-install"
+          echo "$chez" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          echo "$idris\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          echo "IDRIS_PREFIX=$idris" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "PREFIX=$(c:\msys64\usr\bin\cygpath -u $idris)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Verify Scheme
+        run: scheme --version
+
+      - name: Bootstrap Idris2
+        run: c:\msys64\usr\bin\bash -l -c "cd $env:PWD && make bootstrap PREFIX=$env:PREFIX"
+
+      - name: Install Idris2
+        run: c:\msys64\usr\bin\bash -l -c "cd $env:PWD && make install PREFIX=$env:PREFIX"
+
+      - name: Install Idris2 support libraries
+        run: c:\msys64\usr\bin\bash -l -c "cd $env:PWD && make install-with-src-libs PREFIX=$env:PREFIX"
+
+      - name: Package binary zip
+        shell: pwsh
+        run: |
+          $version = "${{ needs.check-upstream.outputs.tag }}"
+          $pkg = "idris2-$version-windows-x86_64"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item -Recurse "$env:IDRIS_PREFIX" "dist\$pkg"
+          Compress-Archive -Path "dist\$pkg" -DestinationPath "dist\$pkg.zip"
+          $hash = (Get-FileHash "dist\$pkg.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $pkg.zip" | Out-File -Encoding ascii "dist\$pkg.zip.sha256"
+          echo "ARTIFACT_NAME=$pkg" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "ARTIFACT_PATH=dist\$pkg.zip" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "ARTIFACT_SHA=dist\$pkg.zip.sha256" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: |
+            ${{ env.ARTIFACT_PATH }}
+            ${{ env.ARTIFACT_SHA }}
+          if-no-files-found: error
+
+  ######################################################################
+  # Publish a GitHub release on this fork with both artifacts.
+  ######################################################################
+  publish-release:
+    name: Publish release
+    needs: [check-upstream, build-linux, build-windows]
+    if: needs.check-upstream.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten artifacts
+        run: |
+          mkdir -p release
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.sha256' \) -exec cp {} release/ \;
+          ls -la release
+
+      - name: Create or update release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.check-upstream.outputs.tag }}
+          name: Idris2 ${{ needs.check-upstream.outputs.tag }}
+          body: |
+            Automated build of upstream [`idris-lang/Idris2@${{ needs.check-upstream.outputs.tag }}`](https://github.com/idris-lang/Idris2/releases/tag/${{ needs.check-upstream.outputs.tag }}).
+
+            Built from upstream source on `${{ github.run_id }}` by `.github/workflows/sync-and-build.yml`.
+          files: release/*
+          fail_on_unmatched_files: true
